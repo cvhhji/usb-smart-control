@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">USB 智能控制</string>
+    <string name="app_description">可配置的 USB、ADB 与 MTP 自动控制模块</string>
+</resources>
