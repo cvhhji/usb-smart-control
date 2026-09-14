@@ -19,7 +19,7 @@
 
 - Android 8.0 或更高版本
 - 支持现代 libxposed API 102 的 LSPosed 环境
-- 模块作用域固定为 `system`
+- 模块作用域 `system_server`
 
 模块声明：
 
@@ -37,12 +37,6 @@ staticScope=true
 4. 打开“USB 智能控制”，选择需要的功能并保存。
 
 游戏列表采用 Android 系统的游戏分类。没有被系统标记为游戏的应用不会出现在列表中。
-
-## 构建
-
-推送到 `main`，或者在 Actions 页面手动运行 **Build APK**。构建完成后下载名为 `USB-Smart-Control` 的 Artifact。
-
-APK 使用仓库 Actions Secrets 中的固定 PKCS#12 密钥签名，可以直接覆盖安装后续版本。
 
 ## 注意
 
