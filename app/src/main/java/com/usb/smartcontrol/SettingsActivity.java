@@ -2,6 +2,7 @@ package com.usb.smartcontrol;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.ComponentName;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ApplicationInfo;
@@ -53,6 +54,7 @@ public final class SettingsActivity extends Activity {
     private Switch autoAdb;
     private Switch autoMtp;
     private Switch mtpUnlockOnly;
+    private Switch launcherVisible;
     private RadioGroup gameMode;
     private Button chooseGames;
     private Button save;
@@ -109,6 +111,13 @@ public final class SettingsActivity extends Activity {
         activationCard.setOnClickListener(ignored -> refreshInjectionStatus());
         content.addView(activationCard, cardParams());
 
+        LinearLayout appCard = card();
+        addSectionTitle(appCard, "应用");
+        launcherVisible = addSwitch(appCard, "在桌面显示图标", "隐藏后可从 LSPosed 模块列表重新打开");
+        launcherVisible.setChecked(isLauncherVisible());
+        launcherVisible.setOnCheckedChangeListener((button, visible) -> setLauncherVisible(visible));
+        content.addView(appCard, cardParams());
+
         LinearLayout usbCard = card();
         addSectionTitle(usbCard, "USB 自动控制");
         autoAdb = addSwitch(usbCard, "自动控制 USB 调试", "接入后快速开启，拔出后关闭");
@@ -154,6 +163,22 @@ public final class SettingsActivity extends Activity {
         scrollView.setFillViewport(true);
         scrollView.addView(content);
         setContentView(scrollView);
+    }
+
+    private boolean isLauncherVisible() {
+        int state = getPackageManager().getComponentEnabledSetting(launcherComponent());
+        return state != PackageManager.COMPONENT_ENABLED_STATE_DISABLED;
+    }
+
+    private void setLauncherVisible(boolean visible) {
+        getPackageManager().setComponentEnabledSetting(
+                launcherComponent(),
+                visible ? PackageManager.COMPONENT_ENABLED_STATE_ENABLED : PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+                PackageManager.DONT_KILL_APP);
+    }
+
+    private ComponentName launcherComponent() {
+        return new ComponentName(this, getPackageName() + ".Launcher");
     }
 
     private void bindXposedService() {
