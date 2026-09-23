@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -63,3 +63,17 @@ jobs:
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 30
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: build-${{ github.run_number }}-${{ github.run_attempt }}
+        run: |
+          VERSION="$(sed -nE 's/^[[:space:]]*versionName = "([^"]+)"/\1/p' app/build.gradle.kts)"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          gh release create "$RELEASE_TAG" \
+            app/build/outputs/apk/debug/USB-Smart-Control.apk \
+            --target "$GITHUB_SHA" \
+            --title "USB 智能控制 ${VERSION} · ${SHORT_SHA}" \
+            --notes "由 GitHub Actions 构建并验证。适用于 Android 8.0 及以上系统，需要支持现代 libxposed API 102 的 LSPosed 环境。" \
+            --latest

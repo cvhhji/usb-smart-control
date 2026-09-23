@@ -28,7 +28,7 @@ staticScope=true
 
 ## 使用
 
-1. 安装 APK。
+1. 从 GitHub Releases 下载并安装 `USB-Smart-Control.apk`。
 2. 在 LSPosed 中启用模块。
 3. 重启手机。
 4. 打开“USB 智能控制”，选择需要的功能并保存。

@@ -14,9 +14,9 @@ android {
     defaultConfig {
         applicationId = "com.usb.smartcontrol"
         minSdk = 26
-        targetSdk = 35
-        versionCode = 351
-        versionName = "3.5.1"
+        targetSdk = 37
+        versionCode = 360
+        versionName = "3.6.0"
     }
 
     signingConfigs {
