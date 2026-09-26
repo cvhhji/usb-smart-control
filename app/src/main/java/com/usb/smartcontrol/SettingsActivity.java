@@ -11,10 +11,13 @@ import android.content.pm.ResolveInfo;
 import android.content.res.ColorStateList;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
 import android.os.Bundle;
+import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.RadioButton;
 import android.widget.RadioGroup;
@@ -34,6 +37,7 @@ import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import io.github.libxposed.service.HookedTarget;
 import io.github.libxposed.service.XposedService;
@@ -47,8 +51,10 @@ public final class SettingsActivity extends Activity {
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final List<GameApp> installedApps = new ArrayList<>();
     private final Set<String> selectedPackages = new TreeSet<>();
+    private final AtomicInteger statusRequest = new AtomicInteger();
 
-    private TextView activationStatus;
+    private TextView activationIcon;
+    private TextView activationTitle;
     private LinearLayout activationCard;
     private TextView gameSummary;
     private Switch autoAdb;
@@ -62,6 +68,13 @@ public final class SettingsActivity extends Activity {
     private XposedService xposedService;
     private int detectedGameCount;
     private boolean gameScanComplete;
+
+    private enum ActivationState {
+        CHECKING,
+        ACTIVE,
+        RESTART_REQUIRED,
+        INACTIVE
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -87,28 +100,24 @@ public final class SettingsActivity extends Activity {
     private void buildUi() {
         LinearLayout content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
-        content.setPadding(dp(20), dp(24), dp(20), dp(32));
+        content.setPadding(dp(18), dp(24), dp(18), dp(36));
         content.setBackgroundColor(color(R.color.page_background));
 
         TextView title = new TextView(this);
         title.setText("USB 智能控制");
         title.setTextColor(color(R.color.text_primary));
-        title.setTextSize(28);
-        title.setTypeface(Typeface.DEFAULT_BOLD);
+        title.setTextSize(30);
+        title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         content.addView(title, matchWrap());
 
         TextView subtitle = new TextView(this);
         subtitle.setText("快速、自动且可配置的 USB 状态控制");
         subtitle.setTextColor(color(R.color.text_secondary));
-        subtitle.setTextSize(15);
-        subtitle.setPadding(0, dp(4), 0, dp(18));
+        subtitle.setTextSize(14);
+        subtitle.setPadding(0, dp(4), 0, dp(20));
         content.addView(subtitle, matchWrap());
 
-        activationCard = card();
-        activationStatus = bodyText("● 未激活");
-        activationStatus.setLineSpacing(dp(4), 1f);
-        activationCard.addView(activationStatus, matchWrap());
-        activationCard.setOnClickListener(ignored -> refreshInjectionStatus());
+        activationCard = activationCard();
         content.addView(activationCard, cardParams());
 
         LinearLayout appCard = card();
@@ -128,7 +137,7 @@ public final class SettingsActivity extends Activity {
         LinearLayout gameCard = card();
         addSectionTitle(gameCard, "游戏场景");
         TextView explanation = bodyText("选择识别方式，游戏期间会临时关闭 USB 调试。");
-        explanation.setPadding(0, 0, 0, dp(8));
+        explanation.setPadding(0, dp(2), 0, dp(10));
         gameCard.addView(explanation, matchWrap());
 
         gameMode = new RadioGroup(this);
@@ -152,7 +161,7 @@ public final class SettingsActivity extends Activity {
         save.setEnabled(false);
         save.setOnClickListener(ignored -> savePreferences());
         LinearLayout.LayoutParams saveParams = matchWrap();
-        saveParams.topMargin = dp(6);
+        saveParams.topMargin = dp(10);
         content.addView(save, saveParams);
 
         TextView note = bodyText("配置保存后会立即同步；首次启用或更新模块后，需重启设备让当前版本注入系统框架。");
@@ -163,6 +172,8 @@ public final class SettingsActivity extends Activity {
         scrollView.setFillViewport(true);
         scrollView.addView(content);
         setContentView(scrollView);
+
+        setActivation(ActivationState.CHECKING);
     }
 
     private boolean isLauncherVisible() {
@@ -193,8 +204,7 @@ public final class SettingsActivity extends Activity {
                         save.setEnabled(true);
                         refreshInjectionStatus();
                     } catch (Throwable error) {
-                        setActivation(false, "配置读取失败：" + safeMessage(error),
-                                "检查框架版本和模块日志后重试。");
+                        setActivation(ActivationState.INACTIVE);
                     }
                 });
             }
@@ -204,8 +214,8 @@ public final class SettingsActivity extends Activity {
                 runOnUiThread(() -> {
                     xposedService = null;
                     preferences = null;
-                    setActivation(false, "未检测到模块框架服务。",
-                            "请在模块管理器中启用模块后重启设备。");
+                    statusRequest.incrementAndGet();
+                    setActivation(ActivationState.INACTIVE);
                     save.setEnabled(false);
                 });
             }
@@ -214,15 +224,17 @@ public final class SettingsActivity extends Activity {
 
     private void refreshInjectionStatus() {
         XposedService service = xposedService;
+        int request = statusRequest.incrementAndGet();
         if (service == null) {
-            setActivation(false, "未检测到模块框架服务。",
-                    "请确认模块已启用，并返回本页面重新检查。");
+            activationCard.postDelayed(() -> {
+                if (statusRequest.get() == request && xposedService == null && !isFinishing()) {
+                    setActivation(ActivationState.INACTIVE);
+                }
+            }, 900);
             return;
         }
         worker.execute(() -> {
-            boolean active = false;
-            String reason = "尚未发现 system_server 注入记录。";
-            String advice = "请确认静态作用域为 system，然后重启设备。";
+            ActivationState state = ActivationState.INACTIVE;
             try {
                 HookedTarget system = null;
                 for (HookedTarget target : service.getRunningTargets()) {
@@ -235,20 +247,21 @@ public final class SettingsActivity extends Activity {
                 if (system != null) {
                     boolean currentVersion = system.getLoadedVersionCode() == BuildConfig.VERSION_CODE;
                     boolean upToDate = system.getState() == HookedTarget.State.UP_TO_DATE;
-                    active = currentVersion && upToDate;
-                    if (!active) {
-                        reason = "系统框架仍在运行旧版本。";
-                        advice = "请重启设备，让当前版本重新注入系统框架。";
+                    if (currentVersion && upToDate) {
+                        state = ActivationState.ACTIVE;
+                    } else {
+                        state = ActivationState.RESTART_REQUIRED;
                     }
                 }
-            } catch (Throwable error) {
-                reason = "注入状态读取失败：" + safeMessage(error);
-                advice = "请确认框架支持 API 102，并检查模块日志。";
+            } catch (Throwable ignored) {
+                state = ActivationState.INACTIVE;
             }
-            boolean finalActive = active;
-            String finalReason = reason;
-            String finalAdvice = advice;
-            runOnUiThread(() -> setActivation(finalActive, finalReason, finalAdvice));
+            ActivationState finalState = state;
+            runOnUiThread(() -> {
+                if (statusRequest.get() == request && xposedService == service && !isFinishing()) {
+                    setActivation(finalState);
+                }
+            });
         });
     }
 
@@ -374,33 +387,94 @@ public final class SettingsActivity extends Activity {
         }
     }
 
-    private void setActivation(boolean active, String reason, String advice) {
-        GradientDrawable background = new GradientDrawable();
-        background.setCornerRadius(dp(18));
-        if (active) {
-            background.setColor(color(R.color.status_active_background));
-            background.setStroke(dp(1), color(R.color.status_active_border));
-            activationStatus.setText("● 已激活");
-            activationStatus.setTextColor(color(R.color.status_active_text));
+    private LinearLayout activationCard() {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(22), dp(22), dp(22), dp(22));
+        card.setFocusable(false);
+
+        LinearLayout main = new LinearLayout(this);
+        main.setGravity(Gravity.CENTER_VERTICAL);
+        main.setOrientation(LinearLayout.HORIZONTAL);
+
+        FrameLayout iconBadge = new FrameLayout(this);
+        activationIcon = new TextView(this);
+        activationIcon.setGravity(Gravity.CENTER);
+        activationIcon.setTextSize(32);
+        activationIcon.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        iconBadge.addView(activationIcon, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        main.addView(iconBadge, new LinearLayout.LayoutParams(dp(58), dp(58)));
+
+        activationTitle = new TextView(this);
+        activationTitle.setTextColor(color(R.color.text_primary));
+        activationTitle.setTextSize(23);
+        activationTitle.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        activationTitle.setPadding(dp(18), 0, 0, 0);
+        activationTitle.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        main.addView(activationTitle, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        card.addView(main, matchWrap());
+
+        return card;
+    }
+
+    private void setActivation(ActivationState state) {
+        int backgroundColor;
+        int borderColor;
+        int titleColor;
+        int iconBackground;
+        int iconForeground;
+        if (state == ActivationState.ACTIVE) {
+            backgroundColor = color(R.color.status_active_background);
+            borderColor = color(R.color.status_active_border);
+            titleColor = color(R.color.status_active_text);
+            iconBackground = color(R.color.status_active_icon_background);
+            iconForeground = color(R.color.status_active_icon_foreground);
+            activationTitle.setText("已激活");
+            activationIcon.setText("✓");
+        } else if (state == ActivationState.INACTIVE || state == ActivationState.RESTART_REQUIRED) {
+            backgroundColor = color(R.color.status_attention_background);
+            borderColor = color(R.color.status_attention_border);
+            titleColor = color(R.color.status_attention_text);
+            iconBackground = color(R.color.status_attention_icon_background);
+            iconForeground = color(R.color.status_attention_icon_foreground);
+            activationTitle.setText(state == ActivationState.RESTART_REQUIRED ? "需重启" : "未激活");
+            activationIcon.setText("!");
         } else {
-            background.setColor(color(R.color.status_inactive_background));
-            background.setStroke(dp(1), color(R.color.status_inactive_border));
-            activationStatus.setText("● 未激活\n\n原因：" + reason + "\n建议：" + advice);
-            activationStatus.setTextColor(color(R.color.status_inactive_text));
+            backgroundColor = color(R.color.status_check_background);
+            borderColor = color(R.color.status_check_border);
+            titleColor = color(R.color.text_primary);
+            iconBackground = color(R.color.status_check_icon_background);
+            iconForeground = color(R.color.status_check_icon_foreground);
+            activationTitle.setText("正在检查");
+            activationIcon.setText("…");
         }
-        activationCard.setBackground(background);
+
+        GradientDrawable cardBackground = new GradientDrawable();
+        cardBackground.setColor(backgroundColor);
+        cardBackground.setCornerRadius(dp(24));
+        cardBackground.setStroke(dp(1), borderColor);
+        activationCard.setBackground(cardBackground);
+
+        GradientDrawable badgeBackground = new GradientDrawable();
+        badgeBackground.setColor(iconBackground);
+        badgeBackground.setCornerRadius(dp(18));
+        activationIcon.setBackground(badgeBackground);
+        activationIcon.setTextColor(iconForeground);
+        activationTitle.setTextColor(titleColor);
     }
 
     private LinearLayout card() {
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(dp(18), dp(16), dp(18), dp(16));
+        card.setPadding(dp(20), dp(18), dp(20), dp(20));
         GradientDrawable background = new GradientDrawable();
         background.setColor(color(R.color.card_background));
-        background.setCornerRadius(dp(18));
+        background.setCornerRadius(dp(22));
         background.setStroke(dp(1), color(R.color.card_border));
         card.setBackground(background);
-        card.setElevation(dp(2));
+        card.setElevation(0);
         return card;
     }
 
@@ -408,9 +482,9 @@ public final class SettingsActivity extends Activity {
         TextView view = new TextView(this);
         view.setText(label);
         view.setTextColor(color(R.color.text_primary));
-        view.setTextSize(19);
-        view.setTypeface(Typeface.DEFAULT_BOLD);
-        view.setPadding(0, 0, 0, dp(10));
+        view.setTextSize(18);
+        view.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        view.setPadding(0, 0, 0, dp(14));
         parent.addView(view, matchWrap());
     }
 
@@ -418,7 +492,7 @@ public final class SettingsActivity extends Activity {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(android.view.Gravity.CENTER_VERTICAL);
-        row.setPadding(0, dp(7), 0, dp(7));
+        row.setPadding(0, dp(9), 0, dp(9));
 
         LinearLayout labels = new LinearLayout(this);
         labels.setOrientation(LinearLayout.VERTICAL);
@@ -434,7 +508,12 @@ public final class SettingsActivity extends Activity {
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
         Switch toggle = new Switch(this);
-        toggle.setButtonTintList(ColorStateList.valueOf(color(R.color.accent)));
+        toggle.setThumbTintList(new ColorStateList(
+                new int[][]{new int[]{android.R.attr.state_checked}, new int[]{}},
+                new int[]{color(R.color.accent), color(R.color.switch_thumb_inactive)}));
+        toggle.setTrackTintList(new ColorStateList(
+                new int[][]{new int[]{android.R.attr.state_checked}, new int[]{}},
+                new int[]{color(R.color.switch_track_active), color(R.color.switch_track_inactive)}));
         row.addView(toggle, wrapWrap());
         parent.addView(row, matchWrap());
         return toggle;
@@ -445,6 +524,8 @@ public final class SettingsActivity extends Activity {
         button.setId(id);
         button.setText(label);
         button.setTextColor(color(R.color.text_primary));
+        button.setMinHeight(dp(48));
+        button.setPadding(dp(2), dp(4), 0, dp(4));
         button.setButtonTintList(new ColorStateList(
                 new int[][]{new int[]{android.R.attr.state_checked}, new int[]{}},
                 new int[]{color(R.color.accent), color(R.color.text_secondary)}));
@@ -462,11 +543,13 @@ public final class SettingsActivity extends Activity {
     private Button primaryButton(String text) {
         Button button = new Button(this);
         button.setText(text);
-        button.setTextColor(0xFFFFFFFF);
+        button.setTextColor(color(R.color.primary_button_text));
         button.setTextSize(16);
         button.setAllCaps(false);
-        button.setBackgroundTintList(ColorStateList.valueOf(color(R.color.accent)));
+        button.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        button.setBackground(rippleBackground(color(R.color.accent), color(R.color.button_ripple), dp(28)));
         button.setMinHeight(dp(52));
+        button.setPadding(dp(22), 0, dp(22), 0);
         return button;
     }
 
@@ -474,9 +557,21 @@ public final class SettingsActivity extends Activity {
         Button button = new Button(this);
         button.setText(text);
         button.setTextColor(color(R.color.accent));
+        button.setTextSize(15);
+        button.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         button.setAllCaps(false);
-        button.setBackgroundTintList(ColorStateList.valueOf(color(R.color.secondary_button)));
+        button.setBackground(rippleBackground(color(R.color.secondary_button),
+                color(R.color.button_ripple), dp(26)));
+        button.setMinHeight(dp(48));
+        button.setPadding(dp(18), 0, dp(18), 0);
         return button;
+    }
+
+    private RippleDrawable rippleBackground(int backgroundColor, int rippleColor, int radius) {
+        GradientDrawable content = new GradientDrawable();
+        content.setColor(backgroundColor);
+        content.setCornerRadius(radius);
+        return new RippleDrawable(ColorStateList.valueOf(rippleColor), content, null);
     }
 
     private LinearLayout.LayoutParams cardParams() {
@@ -503,11 +598,6 @@ public final class SettingsActivity extends Activity {
 
     private int dp(int value) {
         return Math.round(value * getResources().getDisplayMetrics().density);
-    }
-
-    private static String safeMessage(Throwable error) {
-        String message = error.getMessage();
-        return message == null ? error.getClass().getSimpleName() : message;
     }
 
     private record GameApp(String label, String packageName) {
