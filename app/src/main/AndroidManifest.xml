@@ -3,6 +3,7 @@
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
 
     <application
+        android:name=".UsbSmartControlApplication"
         android:allowBackup="false"
         android:description="@string/app_description"
         android:hasCode="true"

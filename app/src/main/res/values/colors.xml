@@ -1,30 +1,33 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <color name="icon_background">#394B44</color>
-    <color name="page_background">#F5F3F2</color>
+    <color name="page_background">#EFEDEC</color>
     <color name="card_background">#FAF9F7</color>
-    <color name="card_border">#D8DEDA</color>
+    <color name="field_background">#F5F3F2</color>
+    <color name="outline">#C7C6C5</color>
     <color name="text_primary">#1B1C1B</color>
     <color name="text_secondary">#464746</color>
+    <color name="text_tertiary">#686A68</color>
     <color name="accent">#51625C</color>
+    <color name="primary_container">#D4E7DF</color>
     <color name="primary_button_text">#FFFFFF</color>
-    <color name="secondary_button">#DBE5E0</color>
+    <color name="secondary_button">#D4E7DF</color>
     <color name="button_ripple">#33574B</color>
     <color name="switch_thumb_inactive">#777776</color>
     <color name="switch_track_active">#D4E7DF</color>
     <color name="switch_track_inactive">#E3E2E1</color>
     <color name="status_active_background">#D4E7DF</color>
-    <color name="status_active_border">#A8C5B7</color>
     <color name="status_active_text">#0F1E1A</color>
     <color name="status_active_icon_background">#51625C</color>
     <color name="status_active_icon_foreground">#FFFFFF</color>
-    <color name="status_attention_background">#FFE8CC</color>
-    <color name="status_attention_border">#E5B875</color>
-    <color name="status_attention_text">#653B0A</color>
-    <color name="status_attention_icon_background">#A65F00</color>
+    <color name="status_attention_background">#F5E7D2</color>
+    <color name="status_attention_text">#4E361A</color>
+    <color name="status_attention_icon_background">#98621E</color>
     <color name="status_attention_icon_foreground">#FFFFFF</color>
-    <color name="status_check_background">#E9EEEB</color>
-    <color name="status_check_border">#CDD5D0</color>
-    <color name="status_check_icon_background">#DBE5E0</color>
-    <color name="status_check_icon_foreground">#23352F</color>
+    <color name="status_inactive_background">#FFDAD6</color>
+    <color name="status_inactive_text">#410002</color>
+    <color name="status_inactive_icon_background">#BA1A1A</color>
+    <color name="status_inactive_icon_foreground">#FFFFFF</color>
+    <color name="status_check_icon_background">#D4E7DF</color>
+    <color name="status_check_icon_foreground">#51625C</color>
 </resources>

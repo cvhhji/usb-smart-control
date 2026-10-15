@@ -18,7 +18,9 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.RadioButton;
 import android.widget.RadioGroup;
 import android.widget.ScrollView;
@@ -41,19 +43,23 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import io.github.libxposed.service.HookedTarget;
 import io.github.libxposed.service.XposedService;
-import io.github.libxposed.service.XposedServiceHelper;
 
 public final class SettingsActivity extends Activity {
     private static final int MODE_ORIENTATION_ID = 1001;
     private static final int MODE_FOREGROUND_ID = 1002;
     private static final int MODE_DISABLED_ID = 1003;
+    private static final long SERVICE_BIND_TIMEOUT_MS = 8000L;
+    private static final long STATUS_RETRY_DELAY_MS = 800L;
+    private static final int MAX_STATUS_RETRIES = 2;
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final List<GameApp> installedApps = new ArrayList<>();
     private final Set<String> selectedPackages = new TreeSet<>();
     private final AtomicInteger statusRequest = new AtomicInteger();
 
-    private TextView activationIcon;
+    private FrameLayout activationIconHolder;
+    private ImageView activationIcon;
+    private ProgressBar activationProgress;
     private TextView activationTitle;
     private LinearLayout activationCard;
     private TextView gameSummary;
@@ -65,9 +71,11 @@ public final class SettingsActivity extends Activity {
     private Button chooseGames;
     private Button save;
     private SharedPreferences preferences;
+    private UsbSmartControlApplication application;
     private XposedService xposedService;
     private int detectedGameCount;
     private boolean gameScanComplete;
+    private boolean destroyed;
 
     private enum ActivationState {
         CHECKING,
@@ -93,6 +101,11 @@ public final class SettingsActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        destroyed = true;
+        statusRequest.incrementAndGet();
+        if (application != null) {
+            application.detach(this);
+        }
         worker.shutdownNow();
         super.onDestroy();
     }
@@ -100,25 +113,45 @@ public final class SettingsActivity extends Activity {
     private void buildUi() {
         LinearLayout content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
-        content.setPadding(dp(18), dp(24), dp(18), dp(36));
+        content.setPadding(dp(20), dp(24), dp(20), dp(36));
         content.setBackgroundColor(color(R.color.page_background));
 
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+
+        TextView mark = new TextView(this);
+        mark.setText("U");
+        mark.setGravity(Gravity.CENTER);
+        mark.setTextColor(color(R.color.accent));
+        mark.setTextSize(22);
+        mark.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        mark.setContentDescription("USB 智能控制");
+        mark.setBackground(roundedBackground(color(R.color.primary_container), dp(16)));
+        header.addView(mark, new LinearLayout.LayoutParams(dp(52), dp(52)));
+
+        LinearLayout heading = new LinearLayout(this);
+        heading.setOrientation(LinearLayout.VERTICAL);
         TextView title = new TextView(this);
         title.setText("USB 智能控制");
         title.setTextColor(color(R.color.text_primary));
-        title.setTextSize(30);
+        title.setTextSize(28);
         title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        content.addView(title, matchWrap());
+        heading.addView(title, matchWrap());
 
-        TextView subtitle = new TextView(this);
-        subtitle.setText("快速、自动且可配置的 USB 状态控制");
-        subtitle.setTextColor(color(R.color.text_secondary));
+        TextView subtitle = bodyText("USB 连接与游戏场景设置");
         subtitle.setTextSize(14);
-        subtitle.setPadding(0, dp(4), 0, dp(20));
-        content.addView(subtitle, matchWrap());
+        heading.addView(subtitle, matchWrap());
+        LinearLayout.LayoutParams headingParams = new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        headingParams.leftMargin = dp(14);
+        header.addView(heading, headingParams);
+        content.addView(header, matchWrap());
 
         activationCard = activationCard();
-        content.addView(activationCard, cardParams());
+        LinearLayout.LayoutParams activationParams = cardParams();
+        activationParams.topMargin = dp(20);
+        content.addView(activationCard, activationParams);
 
         LinearLayout appCard = card();
         addSectionTitle(appCard, "应用");
@@ -193,48 +226,54 @@ public final class SettingsActivity extends Activity {
     }
 
     private void bindXposedService() {
-        XposedServiceHelper.registerListener(new XposedServiceHelper.OnServiceListener() {
-            @Override
-            public void onServiceBind(XposedService service) {
-                runOnUiThread(() -> {
-                    xposedService = service;
-                    try {
-                        preferences = service.getRemotePreferences(Config.GROUP);
-                        loadPreferences();
-                        save.setEnabled(true);
-                        refreshInjectionStatus();
-                    } catch (Throwable error) {
-                        setActivation(ActivationState.INACTIVE);
-                    }
-                });
-            }
+        application = (UsbSmartControlApplication) getApplication();
+        application.attach(this);
+        onXposedServiceChanged(application.getXposedService());
+    }
 
-            @Override
-            public void onServiceDied(XposedService service) {
-                runOnUiThread(() -> {
-                    xposedService = null;
-                    preferences = null;
-                    statusRequest.incrementAndGet();
-                    setActivation(ActivationState.INACTIVE);
-                    save.setEnabled(false);
-                });
-            }
-        });
+    void onXposedServiceChanged(XposedService service) {
+        if (destroyed || isFinishing()) {
+            return;
+        }
+        xposedService = service;
+        if (service == null) {
+            preferences = null;
+            save.setEnabled(false);
+            refreshInjectionStatus();
+            return;
+        }
+        try {
+            preferences = service.getRemotePreferences(Config.GROUP);
+            loadPreferences();
+            save.setEnabled(true);
+        } catch (Throwable ignored) {
+            preferences = null;
+            save.setEnabled(false);
+        }
+        refreshInjectionStatus();
     }
 
     private void refreshInjectionStatus() {
         XposedService service = xposedService;
         int request = statusRequest.incrementAndGet();
         if (service == null) {
+            setActivation(ActivationState.CHECKING);
             activationCard.postDelayed(() -> {
-                if (statusRequest.get() == request && xposedService == null && !isFinishing()) {
+                if (statusRequest.get() == request && xposedService == null
+                        && !isFinishing() && !destroyed) {
                     setActivation(ActivationState.INACTIVE);
                 }
-            }, 900);
+            }, SERVICE_BIND_TIMEOUT_MS);
             return;
         }
+        setActivation(ActivationState.CHECKING);
+        queryInjectionStatus(service, request, 0);
+    }
+
+    private void queryInjectionStatus(XposedService service, int request, int retryCount) {
         worker.execute(() -> {
             ActivationState state = ActivationState.INACTIVE;
+            boolean retry = false;
             try {
                 HookedTarget system = null;
                 for (HookedTarget target : service.getRunningTargets()) {
@@ -244,21 +283,36 @@ public final class SettingsActivity extends Activity {
                         break;
                     }
                 }
-                if (system != null) {
-                    boolean currentVersion = system.getLoadedVersionCode() == BuildConfig.VERSION_CODE;
-                    boolean upToDate = system.getState() == HookedTarget.State.UP_TO_DATE;
-                    if (currentVersion && upToDate) {
+                if (system == null) {
+                    retry = retryCount < MAX_STATUS_RETRIES;
+                } else {
+                    long currentVersion = getPackageManager()
+                            .getPackageInfo(getPackageName(), 0).versionCode;
+                    long loadedVersion = system.getLoadedVersionCode();
+                    HookedTarget.State targetState = system.getState();
+                    if (loadedVersion == currentVersion && targetState == HookedTarget.State.UP_TO_DATE) {
                         state = ActivationState.ACTIVE;
-                    } else {
+                    } else if (targetState == HookedTarget.State.STALE
+                            || (loadedVersion > 0 && loadedVersion != currentVersion)) {
                         state = ActivationState.RESTART_REQUIRED;
                     }
                 }
             } catch (Throwable ignored) {
-                state = ActivationState.INACTIVE;
+                retry = retryCount < MAX_STATUS_RETRIES;
+            }
+            if (retry) {
+                activationCard.postDelayed(() -> {
+                    if (statusRequest.get() == request && xposedService == service
+                            && !isFinishing() && !destroyed) {
+                        queryInjectionStatus(service, request, retryCount + 1);
+                    }
+                }, STATUS_RETRY_DELAY_MS);
+                return;
             }
             ActivationState finalState = state;
             runOnUiThread(() -> {
-                if (statusRequest.get() == request && xposedService == service && !isFinishing()) {
+                if (statusRequest.get() == request && xposedService == service
+                        && !isFinishing() && !destroyed) {
                     setActivation(finalState);
                 }
             });
@@ -389,91 +443,96 @@ public final class SettingsActivity extends Activity {
 
     private LinearLayout activationCard() {
         LinearLayout card = new LinearLayout(this);
-        card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(dp(22), dp(22), dp(22), dp(22));
+        card.setOrientation(LinearLayout.HORIZONTAL);
+        card.setGravity(Gravity.CENTER_VERTICAL);
+        card.setPadding(dp(20), dp(18), dp(20), dp(18));
+        card.setMinimumHeight(dp(96));
         card.setFocusable(false);
+        card.setClickable(false);
 
-        LinearLayout main = new LinearLayout(this);
-        main.setGravity(Gravity.CENTER_VERTICAL);
-        main.setOrientation(LinearLayout.HORIZONTAL);
-
-        FrameLayout iconBadge = new FrameLayout(this);
-        activationIcon = new TextView(this);
-        activationIcon.setGravity(Gravity.CENTER);
-        activationIcon.setTextSize(32);
-        activationIcon.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        iconBadge.addView(activationIcon, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        main.addView(iconBadge, new LinearLayout.LayoutParams(dp(58), dp(58)));
+        activationIconHolder = new FrameLayout(this);
+        activationIconHolder.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        activationIcon = new ImageView(this);
+        activationIcon.setVisibility(View.GONE);
+        activationIcon.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        FrameLayout.LayoutParams iconParams = new FrameLayout.LayoutParams(dp(26), dp(26), Gravity.CENTER);
+        activationIconHolder.addView(activationIcon, iconParams);
+        activationProgress = new ProgressBar(this);
+        activationProgress.setIndeterminateTintList(ColorStateList.valueOf(color(R.color.accent)));
+        activationProgress.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        FrameLayout.LayoutParams progressParams = new FrameLayout.LayoutParams(
+                dp(26), dp(26), Gravity.CENTER);
+        activationIconHolder.addView(activationProgress, progressParams);
+        card.addView(activationIconHolder, new LinearLayout.LayoutParams(dp(52), dp(52)));
 
         activationTitle = new TextView(this);
         activationTitle.setTextColor(color(R.color.text_primary));
-        activationTitle.setTextSize(23);
+        activationTitle.setTextSize(22);
         activationTitle.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        activationTitle.setPadding(dp(18), 0, 0, 0);
         activationTitle.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
-        main.addView(activationTitle, new LinearLayout.LayoutParams(
-                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        card.addView(main, matchWrap());
+        LinearLayout.LayoutParams titleParams = new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        titleParams.leftMargin = dp(16);
+        card.addView(activationTitle, titleParams);
 
         return card;
     }
 
     private void setActivation(ActivationState state) {
-        int backgroundColor;
-        int borderColor;
-        int titleColor;
+        int cardColor;
         int iconBackground;
         int iconForeground;
+        int labelColor;
+        int iconResource;
+        String label;
+        boolean checking = state == ActivationState.CHECKING;
         if (state == ActivationState.ACTIVE) {
-            backgroundColor = color(R.color.status_active_background);
-            borderColor = color(R.color.status_active_border);
-            titleColor = color(R.color.status_active_text);
+            cardColor = color(R.color.status_active_background);
             iconBackground = color(R.color.status_active_icon_background);
             iconForeground = color(R.color.status_active_icon_foreground);
-            activationTitle.setText("已激活");
-            activationIcon.setText("✓");
-        } else if (state == ActivationState.INACTIVE || state == ActivationState.RESTART_REQUIRED) {
-            backgroundColor = color(R.color.status_attention_background);
-            borderColor = color(R.color.status_attention_border);
-            titleColor = color(R.color.status_attention_text);
+            labelColor = color(R.color.status_active_text);
+            iconResource = R.drawable.ic_status_check;
+            label = "已激活";
+        } else if (state == ActivationState.RESTART_REQUIRED) {
+            cardColor = color(R.color.status_attention_background);
             iconBackground = color(R.color.status_attention_icon_background);
             iconForeground = color(R.color.status_attention_icon_foreground);
-            activationTitle.setText(state == ActivationState.RESTART_REQUIRED ? "需重启" : "未激活");
-            activationIcon.setText("!");
+            labelColor = color(R.color.status_attention_text);
+            iconResource = R.drawable.ic_status_attention;
+            label = "需重启";
+        } else if (state == ActivationState.INACTIVE) {
+            cardColor = color(R.color.status_inactive_background);
+            iconBackground = color(R.color.status_inactive_icon_background);
+            iconForeground = color(R.color.status_inactive_icon_foreground);
+            labelColor = color(R.color.status_inactive_text);
+            iconResource = R.drawable.ic_status_attention;
+            label = "未激活";
         } else {
-            backgroundColor = color(R.color.status_check_background);
-            borderColor = color(R.color.status_check_border);
-            titleColor = color(R.color.text_primary);
+            cardColor = color(R.color.card_background);
             iconBackground = color(R.color.status_check_icon_background);
             iconForeground = color(R.color.status_check_icon_foreground);
-            activationTitle.setText("正在检查");
-            activationIcon.setText("…");
+            labelColor = color(R.color.text_secondary);
+            iconResource = 0;
+            label = "正在检查…";
         }
-
-        GradientDrawable cardBackground = new GradientDrawable();
-        cardBackground.setColor(backgroundColor);
-        cardBackground.setCornerRadius(dp(24));
-        cardBackground.setStroke(dp(1), borderColor);
-        activationCard.setBackground(cardBackground);
-
-        GradientDrawable badgeBackground = new GradientDrawable();
-        badgeBackground.setColor(iconBackground);
-        badgeBackground.setCornerRadius(dp(18));
-        activationIcon.setBackground(badgeBackground);
-        activationIcon.setTextColor(iconForeground);
-        activationTitle.setTextColor(titleColor);
+        activationCard.setBackground(roundedBackground(cardColor, dp(24)));
+        activationIconHolder.setBackground(roundedBackground(iconBackground, dp(26)));
+        activationTitle.setText(label);
+        activationTitle.setTextColor(labelColor);
+        activationProgress.setIndeterminateTintList(ColorStateList.valueOf(iconForeground));
+        activationProgress.setVisibility(checking ? View.VISIBLE : View.GONE);
+        activationIcon.setVisibility(checking ? View.GONE : View.VISIBLE);
+        if (!checking) {
+            activationIcon.setImageResource(iconResource);
+            activationIcon.setImageTintList(ColorStateList.valueOf(iconForeground));
+        }
     }
 
     private LinearLayout card() {
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
         card.setPadding(dp(20), dp(18), dp(20), dp(20));
-        GradientDrawable background = new GradientDrawable();
-        background.setColor(color(R.color.card_background));
-        background.setCornerRadius(dp(22));
-        background.setStroke(dp(1), color(R.color.card_border));
-        card.setBackground(background);
+        card.setBackground(roundedBackground(color(R.color.card_background), dp(20)));
         card.setElevation(0);
         return card;
     }
@@ -548,7 +607,7 @@ public final class SettingsActivity extends Activity {
         button.setAllCaps(false);
         button.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         button.setBackground(rippleBackground(color(R.color.accent), color(R.color.button_ripple), dp(28)));
-        button.setMinHeight(dp(52));
+        button.setMinHeight(dp(56));
         button.setPadding(dp(22), 0, dp(22), 0);
         return button;
     }
@@ -572,6 +631,13 @@ public final class SettingsActivity extends Activity {
         content.setColor(backgroundColor);
         content.setCornerRadius(radius);
         return new RippleDrawable(ColorStateList.valueOf(rippleColor), content, null);
+    }
+
+    private GradientDrawable roundedBackground(int backgroundColor, int radius) {
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(backgroundColor);
+        background.setCornerRadius(radius);
+        return background;
     }
 
     private LinearLayout.LayoutParams cardParams() {
