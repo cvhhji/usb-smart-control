@@ -16,6 +16,7 @@ import android.os.HandlerThread;
 import android.provider.Settings;
 import android.util.Log;
 
+import java.lang.reflect.Array;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.List;
@@ -26,6 +27,10 @@ import io.github.libxposed.api.XposedInterface;
 final class UsbStateController {
     private static final String TAG = "UsbSmartControl";
     private static final String ACTION_USB_STATE = "android.hardware.usb.action.USB_STATE";
+    private static final String ACTION_USB_PORT_CHANGED =
+            "android.hardware.usb.action.USB_PORT_CHANGED";
+    private static final int USB_DATA_ROLE_DEVICE = 2;
+    private static final long USB_DISCONNECT_DEBOUNCE_MS = 5000L;
     private static final AtomicBoolean STARTED = new AtomicBoolean();
     private static volatile UsbStateController instance;
 
@@ -34,6 +39,7 @@ final class UsbStateController {
     private final SharedPreferences preferences;
     private final Handler handler;
     private final Runnable evaluateTask = this::evaluate;
+    private final Runnable disconnectTask = this::finishDisconnect;
     private boolean connected;
     private boolean unlockedSinceBoot;
 
@@ -81,6 +87,7 @@ final class UsbStateController {
     private void register() {
         IntentFilter filter = new IntentFilter();
         filter.addAction(ACTION_USB_STATE);
+        filter.addAction(ACTION_USB_PORT_CHANGED);
         filter.addAction(Intent.ACTION_USER_PRESENT);
         filter.addAction(Intent.ACTION_SCREEN_ON);
         filter.addAction(Intent.ACTION_SCREEN_OFF);
@@ -90,9 +97,13 @@ final class UsbStateController {
         BroadcastReceiver receiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context ignored, Intent intent) {
-                if (ACTION_USB_STATE.equals(intent.getAction())) {
-                    connected = intent.getBooleanExtra("connected", false);
-                } else if (Intent.ACTION_USER_PRESENT.equals(intent.getAction())) {
+                String action = intent.getAction();
+                if (ACTION_USB_STATE.equals(action) || ACTION_USB_PORT_CHANGED.equals(action)) {
+                    boolean broadcastConnected = intent.getBooleanExtra("connected", false);
+                    handler.post(() -> handleUsbConnectionEvent(action, broadcastConnected));
+                    return;
+                }
+                if (Intent.ACTION_USER_PRESENT.equals(action)) {
                     unlockedSinceBoot = true;
                 }
                 evaluateNow();
@@ -105,8 +116,126 @@ final class UsbStateController {
         } else {
             sticky = context.registerReceiver(receiver, filter);
         }
-        if (sticky != null && ACTION_USB_STATE.equals(sticky.getAction())) {
+        Boolean portConnection = readPhysicalUsbConnection();
+        if (portConnection != null) {
+            connected = portConnection;
+            xposed.log(Log.INFO, TAG, "USB port status is available");
+        } else if (sticky != null && ACTION_USB_STATE.equals(sticky.getAction())) {
             connected = sticky.getBooleanExtra("connected", false);
+            xposed.log(Log.INFO, TAG, "USB broadcast fallback is active");
+        }
+    }
+
+    private void handleUsbConnectionEvent(String action, boolean broadcastConnected) {
+        Boolean portConnection = readPhysicalUsbConnection();
+        if (portConnection != null) {
+            handler.removeCallbacks(disconnectTask);
+            if (connected != portConnection) {
+                xposed.log(Log.INFO, TAG, "USB device-mode connection changed: "
+                        + portConnection);
+            }
+            connected = portConnection;
+            evaluateNow();
+            return;
+        }
+
+        if (!ACTION_USB_STATE.equals(action)) {
+            return;
+        }
+        if (broadcastConnected) {
+            handler.removeCallbacks(disconnectTask);
+            connected = true;
+            evaluateNow();
+            return;
+        }
+        handler.removeCallbacks(disconnectTask);
+        handler.postDelayed(disconnectTask, USB_DISCONNECT_DEBOUNCE_MS);
+    }
+
+    private void finishDisconnect() {
+        Boolean portConnection = readPhysicalUsbConnection();
+        connected = portConnection != null && portConnection;
+        evaluate();
+    }
+
+    private Boolean readPhysicalUsbConnection() {
+        try {
+            UsbManager usbManager = (UsbManager) context.getSystemService(Context.USB_SERVICE);
+            if (usbManager == null) {
+                return null;
+            }
+            Method getPorts = findMethod(usbManager.getClass(), "getPorts");
+            if (getPorts == null) {
+                return null;
+            }
+            getPorts.setAccessible(true);
+            Object ports = getPorts.invoke(usbManager);
+            int count;
+            if (ports instanceof List<?>) {
+                count = ((List<?>) ports).size();
+            } else if (ports != null && ports.getClass().isArray()) {
+                count = Array.getLength(ports);
+            } else {
+                return null;
+            }
+            if (count == 0) {
+                return null;
+            }
+
+            boolean hasStatus = false;
+            boolean hasUnknownStatus = false;
+            for (int index = 0; index < count; index++) {
+                Object port = ports instanceof List<?>
+                        ? ((List<?>) ports).get(index)
+                        : Array.get(ports, index);
+                if (port == null) {
+                    hasUnknownStatus = true;
+                    continue;
+                }
+                Method getStatus = findMethod(port.getClass(), "getStatus");
+                if (getStatus == null) {
+                    hasUnknownStatus = true;
+                    continue;
+                }
+                getStatus.setAccessible(true);
+                Object status = getStatus.invoke(port);
+                if (status == null) {
+                    hasUnknownStatus = true;
+                    continue;
+                }
+                Method isConnected = findMethod(status.getClass(), "isConnected");
+                if (isConnected == null) {
+                    hasUnknownStatus = true;
+                    continue;
+                }
+                isConnected.setAccessible(true);
+                Object value = isConnected.invoke(status);
+                if (!(value instanceof Boolean)) {
+                    hasUnknownStatus = true;
+                    continue;
+                }
+                if ((Boolean) value) {
+                    Method getCurrentDataRole = findMethod(status.getClass(),
+                            "getCurrentDataRole");
+                    if (getCurrentDataRole == null) {
+                        hasUnknownStatus = true;
+                        continue;
+                    }
+                    getCurrentDataRole.setAccessible(true);
+                    Object dataRole = getCurrentDataRole.invoke(status);
+                    if (!(dataRole instanceof Number)) {
+                        hasUnknownStatus = true;
+                        continue;
+                    }
+                    if (((Number) dataRole).intValue() == USB_DATA_ROLE_DEVICE) {
+                        return true;
+                    }
+                }
+                hasStatus = true;
+            }
+            return hasUnknownStatus ? null : hasStatus ? false : null;
+        } catch (Throwable ignored) {
+            return null;
         }
     }
 
