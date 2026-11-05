@@ -33,13 +33,15 @@ jobs:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/usb-smart-control.p12"
 
-      - name: Build installable APK
+      - name: Test USB transitions and build installable APK
         env:
           ANDROID_SIGNING_STORE_FILE: ${{ runner.temp }}/usb-smart-control.p12
           ANDROID_SIGNING_STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_SIGNING_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: gradle --no-daemon :app:assembleDebug
+        run: |
+          gradle --no-daemon :app:testDebugUnitTest :app:assembleDebug
+          head -n 2 app/build/test-results/testDebugUnitTest/TEST-com.usb.smartcontrol.UsbConnectionStateTest.xml
 
       - name: Name APK
         run: mv app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/USB-Smart-Control.apk

@@ -15,8 +15,8 @@ android {
         applicationId = "com.usb.smartcontrol"
         minSdk = 26
         targetSdk = 37
-        versionCode = 383
-        versionName = "3.8.3"
+        versionCode = 390
+        versionName = "3.9.0"
     }
 
     signingConfigs {
@@ -61,4 +61,5 @@ android {
 dependencies {
     compileOnly("io.github.libxposed:api:102.0.0")
     implementation("io.github.libxposed:service:102.0.0")
+    testImplementation("junit:junit:4.13.2")
 }

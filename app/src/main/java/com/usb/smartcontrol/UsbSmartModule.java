@@ -17,17 +17,49 @@ public final class UsbSmartModule extends XposedModule {
 
     @Override
     public void onModuleLoaded(ModuleLoadedParam param) {
-        log(Log.INFO, TAG, "API 102 module loaded in " + param.getProcessName());
+        log(Log.INFO, TAG, "API 102 module " + BuildConfig.VERSION_NAME
+                + " loaded in " + param.getProcessName());
     }
 
     @Override
     public void onSystemServerStarting(SystemServerStartingParam param) {
+        installUsbStateEventHook(param.getClassLoader());
         try {
             installBootPhaseHook(param.getClassLoader());
             installForegroundEventHook(param.getClassLoader());
         } catch (Throwable error) {
             log(Log.ERROR, TAG, "Unable to install SystemServer hooks", error);
         }
+    }
+
+    private void installUsbStateEventHook(ClassLoader classLoader) {
+        String[][] candidates = {
+                {"com.android.server.usb.UsbDeviceManager$UsbHandler", "updateState"},
+                {"com.android.server.usb.UsbDeviceManager", "updateGadgetState"}
+        };
+        for (String[] candidate : candidates) {
+            try {
+                Class<?> type = Class.forName(candidate[0], false, classLoader);
+                Method method = type.getDeclaredMethod(candidate[1], String.class);
+                method.setAccessible(true);
+                hook(method)
+                        .setId("usb-gadget-event")
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .intercept(chain -> {
+                            Object result = chain.proceed();
+                            Object state = chain.getArgs().get(0);
+                            if (state instanceof String) {
+                                UsbStateController.notifyUsbStateChanged((String) state);
+                            }
+                            return result;
+                        });
+                log(Log.INFO, TAG, "USB gadget event hook installed: "
+                        + candidate[0] + "." + candidate[1]);
+                return;
+            } catch (Throwable ignored) {
+            }
+        }
+        log(Log.WARN, TAG, "USB gadget event hook unavailable; using USB broadcasts");
     }
 
     private void installBootPhaseHook(ClassLoader classLoader) throws ClassNotFoundException {
