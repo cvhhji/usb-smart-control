@@ -30,6 +30,10 @@ final class UsbStateController {
     private static final String ACTION_USB_PORT_CHANGED =
             "android.hardware.usb.action.USB_PORT_CHANGED";
     private static final int USB_DATA_ROLE_DEVICE = 2;
+    private static final int USB_DATA_STATUS_ENABLED = 1;
+    private static final int USB_POWER_BRICK_STATUS_CONNECTED = 1;
+    private static final int USB_POWER_BRICK_STATUS_DISCONNECTED = 2;
+    private static final int USB_COMPLIANCE_WARNING_MISSING_DATA_LINES = 6;
     private static final long USB_DISCONNECT_DEBOUNCE_MS = 5000L;
     private static final AtomicBoolean STARTED = new AtomicBoolean();
     private static volatile UsbStateController instance;
@@ -40,7 +44,8 @@ final class UsbStateController {
     private final Handler handler;
     private final Runnable evaluateTask = this::evaluate;
     private final Runnable disconnectTask = this::finishDisconnect;
-    private boolean connected;
+    private boolean dataConnected;
+    private boolean configuredDataConnection;
     private boolean unlockedSinceBoot;
 
     private UsbStateController(Context context, XposedInterface xposed,
@@ -99,8 +104,8 @@ final class UsbStateController {
             public void onReceive(Context ignored, Intent intent) {
                 String action = intent.getAction();
                 if (ACTION_USB_STATE.equals(action) || ACTION_USB_PORT_CHANGED.equals(action)) {
-                    boolean broadcastConnected = intent.getBooleanExtra("connected", false);
-                    handler.post(() -> handleUsbConnectionEvent(action, broadcastConnected));
+                    boolean broadcastConfigured = intent.getBooleanExtra("configured", false);
+                    handler.post(() -> handleUsbConnectionEvent(action, broadcastConfigured));
                     return;
                 }
                 if (Intent.ACTION_USER_PRESENT.equals(action)) {
@@ -118,43 +123,69 @@ final class UsbStateController {
         }
         Boolean portConnection = readPhysicalUsbConnection();
         if (portConnection != null) {
-            connected = portConnection;
-            xposed.log(Log.INFO, TAG, "USB port status is available");
+            dataConnected = portConnection;
+            configuredDataConnection = portConnection;
+            xposed.log(Log.INFO, TAG, "USB data status is available");
         } else if (sticky != null && ACTION_USB_STATE.equals(sticky.getAction())) {
-            connected = sticky.getBooleanExtra("connected", false);
-            xposed.log(Log.INFO, TAG, "USB broadcast fallback is active");
+            configuredDataConnection = sticky.getBooleanExtra("configured", false);
+            dataConnected = configuredDataConnection;
+            xposed.log(Log.INFO, TAG, "USB configured-state fallback is active");
         }
     }
 
-    private void handleUsbConnectionEvent(String action, boolean broadcastConnected) {
+    private void handleUsbConnectionEvent(String action, boolean broadcastConfigured) {
+        if (ACTION_USB_STATE.equals(action)) {
+            configuredDataConnection = broadcastConfigured;
+        }
         Boolean portConnection = readPhysicalUsbConnection();
         if (portConnection != null) {
-            handler.removeCallbacks(disconnectTask);
-            if (connected != portConnection) {
-                xposed.log(Log.INFO, TAG, "USB device-mode connection changed: "
-                        + portConnection);
+            if (portConnection) {
+                handler.removeCallbacks(disconnectTask);
+                configuredDataConnection = true;
+                if (!dataConnected) {
+                    xposed.log(Log.INFO, TAG, "USB data connection changed: true");
+                }
+                dataConnected = true;
+                evaluateNow();
+            } else {
+                scheduleDisconnect();
             }
-            connected = portConnection;
-            evaluateNow();
             return;
         }
 
         if (!ACTION_USB_STATE.equals(action)) {
             return;
         }
-        if (broadcastConnected) {
+        if (broadcastConfigured) {
             handler.removeCallbacks(disconnectTask);
-            connected = true;
+            boolean wasDataConnected = dataConnected;
+            dataConnected = true;
+            if (!wasDataConnected) {
+                xposed.log(Log.INFO, TAG, "USB configured data connection detected");
+            }
             evaluateNow();
             return;
         }
+        scheduleDisconnect();
+    }
+
+    private void scheduleDisconnect() {
         handler.removeCallbacks(disconnectTask);
         handler.postDelayed(disconnectTask, USB_DISCONNECT_DEBOUNCE_MS);
     }
 
     private void finishDisconnect() {
         Boolean portConnection = readPhysicalUsbConnection();
-        connected = portConnection != null && portConnection;
+        boolean wasDataConnected = dataConnected;
+        if (portConnection != null) {
+            dataConnected = portConnection;
+            configuredDataConnection = portConnection;
+        } else {
+            dataConnected = configuredDataConnection;
+        }
+        if (wasDataConnected != dataConnected) {
+            xposed.log(Log.INFO, TAG, "USB data connection changed: " + dataConnected);
+        }
         evaluate();
     }
 
@@ -228,6 +259,31 @@ final class UsbStateController {
                         continue;
                     }
                     if (((Number) dataRole).intValue() == USB_DATA_ROLE_DEVICE) {
+                        Method getUsbDataStatus = findMethod(status.getClass(), "getUsbDataStatus");
+                        if (getUsbDataStatus == null) {
+                            hasUnknownStatus = true;
+                            continue;
+                        }
+                        getUsbDataStatus.setAccessible(true);
+                        Object usbDataStatus = getUsbDataStatus.invoke(status);
+                        if (!(usbDataStatus instanceof Number)) {
+                            hasUnknownStatus = true;
+                            continue;
+                        }
+                        if ((((Number) usbDataStatus).intValue() & USB_DATA_STATUS_ENABLED) == 0
+                                || hasMissingDataLines(status)) {
+                            hasStatus = true;
+                            continue;
+                        }
+                        Boolean nonPowerBrick = isNonPowerBrick(status);
+                        if (nonPowerBrick == null) {
+                            hasUnknownStatus = true;
+                            continue;
+                        }
+                        if (!nonPowerBrick) {
+                            hasStatus = true;
+                            continue;
+                        }
                         return true;
                     }
                 }
@@ -237,6 +293,43 @@ final class UsbStateController {
         } catch (Throwable ignored) {
             return null;
         }
+    }
+
+    private Boolean isNonPowerBrick(Object status) throws ReflectiveOperationException {
+        Method method = findMethod(status.getClass(), "getPowerBrickConnectionStatus");
+        if (method == null) {
+            return null;
+        }
+        method.setAccessible(true);
+        Object value = method.invoke(status);
+        if (!(value instanceof Number)) {
+            return null;
+        }
+        int statusValue = ((Number) value).intValue();
+        if (statusValue == USB_POWER_BRICK_STATUS_CONNECTED) {
+            return false;
+        }
+        return statusValue == USB_POWER_BRICK_STATUS_DISCONNECTED ? true : null;
+    }
+
+    private boolean hasMissingDataLines(Object status) throws ReflectiveOperationException {
+        Method method = findMethod(status.getClass(), "getComplianceWarnings");
+        if (method == null) {
+            return false;
+        }
+        method.setAccessible(true);
+        Object warnings = method.invoke(status);
+        if (warnings == null || !warnings.getClass().isArray()) {
+            return false;
+        }
+        for (int index = 0; index < Array.getLength(warnings); index++) {
+            Object warning = Array.get(warnings, index);
+            if (warning instanceof Number
+                    && ((Number) warning).intValue() == USB_COMPLIANCE_WARNING_MISSING_DATA_LINES) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void evaluate() {
@@ -250,11 +343,11 @@ final class UsbStateController {
 
             boolean gameBlocked = isGameBlocked();
             boolean enableAdb = Config.autoAdb(preferences)
-                    && connected
+                    && dataConnected
                     && unlockedSinceBoot
                     && !gameBlocked;
             boolean enableMtp = Config.autoMtp(preferences)
-                    && connected
+                    && dataConnected
                     && (!Config.mtpUnlockOnly(preferences) || !locked);
 
             applyAdbSetting(enableAdb);
