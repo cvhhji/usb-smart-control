@@ -29,6 +29,7 @@ final class UsbStateController {
     private static final String ACTION_USB_STATE = "android.hardware.usb.action.USB_STATE";
     private static final String ACTION_USB_PORT_CHANGED =
             "android.hardware.usb.action.USB_PORT_CHANGED";
+    private static final int USB_DATA_ROLE_HOST = 1;
     private static final int USB_DATA_ROLE_DEVICE = 2;
     private static final int USB_DATA_STATUS_ENABLED = 1;
     private static final int USB_POWER_BRICK_STATUS_CONNECTED = 1;
@@ -46,6 +47,7 @@ final class UsbStateController {
     private final Runnable disconnectTask = this::finishDisconnect;
     private boolean dataConnected;
     private boolean configuredDataConnection;
+    private boolean broadcastPhysicalConnected;
     private boolean unlockedSinceBoot;
 
     private UsbStateController(Context context, XposedInterface xposed,
@@ -104,8 +106,10 @@ final class UsbStateController {
             public void onReceive(Context ignored, Intent intent) {
                 String action = intent.getAction();
                 if (ACTION_USB_STATE.equals(action) || ACTION_USB_PORT_CHANGED.equals(action)) {
+                    boolean broadcastConnected = intent.getBooleanExtra("connected", false);
                     boolean broadcastConfigured = intent.getBooleanExtra("configured", false);
-                    handler.post(() -> handleUsbConnectionEvent(action, broadcastConfigured));
+                    handler.post(() -> handleUsbConnectionEvent(
+                            action, broadcastConnected, broadcastConfigured));
                     return;
                 }
                 if (Intent.ACTION_USER_PRESENT.equals(action)) {
@@ -122,9 +126,13 @@ final class UsbStateController {
             sticky = context.registerReceiver(receiver, filter);
         }
         Boolean portConnection = readPhysicalUsbConnection();
+        if (sticky != null && ACTION_USB_STATE.equals(sticky.getAction())) {
+            broadcastPhysicalConnected = sticky.getBooleanExtra("connected", false);
+        }
         if (portConnection != null) {
             dataConnected = portConnection;
             configuredDataConnection = portConnection;
+            broadcastPhysicalConnected |= portConnection;
             xposed.log(Log.INFO, TAG, "USB data status is available");
         } else if (sticky != null && ACTION_USB_STATE.equals(sticky.getAction())) {
             configuredDataConnection = sticky.getBooleanExtra("configured", false);
@@ -133,14 +141,17 @@ final class UsbStateController {
         }
     }
 
-    private void handleUsbConnectionEvent(String action, boolean broadcastConfigured) {
+    private void handleUsbConnectionEvent(String action, boolean broadcastConnected,
+                                          boolean broadcastConfigured) {
         if (ACTION_USB_STATE.equals(action)) {
+            broadcastPhysicalConnected = broadcastConnected;
             configuredDataConnection = broadcastConfigured;
         }
         Boolean portConnection = readPhysicalUsbConnection();
         if (portConnection != null) {
             if (portConnection) {
                 handler.removeCallbacks(disconnectTask);
+                broadcastPhysicalConnected = true;
                 configuredDataConnection = true;
                 if (!dataConnected) {
                     xposed.log(Log.INFO, TAG, "USB data connection changed: true");
@@ -166,7 +177,9 @@ final class UsbStateController {
             evaluateNow();
             return;
         }
-        scheduleDisconnect();
+        if (!broadcastConnected) {
+            scheduleDisconnect();
+        }
     }
 
     private void scheduleDisconnect() {
@@ -180,8 +193,10 @@ final class UsbStateController {
         if (portConnection != null) {
             dataConnected = portConnection;
             configuredDataConnection = portConnection;
+        } else if (!broadcastPhysicalConnected) {
+            dataConnected = false;
         } else {
-            dataConnected = configuredDataConnection;
+            dataConnected = configuredDataConnection || dataConnected;
         }
         if (wasDataConnected != dataConnected) {
             xposed.log(Log.INFO, TAG, "USB data connection changed: " + dataConnected);
@@ -258,7 +273,8 @@ final class UsbStateController {
                         hasUnknownStatus = true;
                         continue;
                     }
-                    if (((Number) dataRole).intValue() == USB_DATA_ROLE_DEVICE) {
+                    int currentDataRole = ((Number) dataRole).intValue();
+                    if (currentDataRole == USB_DATA_ROLE_DEVICE) {
                         Method getUsbDataStatus = findMethod(status.getClass(), "getUsbDataStatus");
                         if (getUsbDataStatus == null) {
                             hasUnknownStatus = true;
@@ -270,8 +286,7 @@ final class UsbStateController {
                             hasUnknownStatus = true;
                             continue;
                         }
-                        if ((((Number) usbDataStatus).intValue() & USB_DATA_STATUS_ENABLED) == 0
-                                || hasMissingDataLines(status)) {
+                        if (hasMissingDataLines(status)) {
                             hasStatus = true;
                             continue;
                         }
@@ -284,8 +299,18 @@ final class UsbStateController {
                             hasStatus = true;
                             continue;
                         }
+                        if ((((Number) usbDataStatus).intValue() & USB_DATA_STATUS_ENABLED) == 0) {
+                            hasUnknownStatus = true;
+                            continue;
+                        }
                         return true;
                     }
+                    if (currentDataRole == USB_DATA_ROLE_HOST) {
+                        hasStatus = true;
+                        continue;
+                    }
+                    hasUnknownStatus = true;
+                    continue;
                 }
                 hasStatus = true;
             }
